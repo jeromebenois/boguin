@@ -231,7 +231,7 @@ impl Client {
 
            let dns_name = webpki::DNSNameRef::try_from_ascii_str(domain).unwrap();
            let mut sess = rustls::ClientSession::new(&Arc::new(config), dns_name);
-           let mut sock = TcpStream::connect(format!("{}:443", domain)).unwrap();
+           let mut sock = TcpStream::connect(format!("{}:443", domain))?;
            (sess, sock)
        };
        let mut tls_stream = rustls::Stream::new(&mut sess, &mut sock);
