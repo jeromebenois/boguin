@@ -21,6 +21,11 @@ use webpki_roots;
 use body::{Body, FromBody, ToBody};
 use http1;
 use util::{is_persistent_connection, is_redirect_method_get, is_redirect_status, wrap_error};
+use std::io::ErrorKind;
+use rustls::Stream;
+use rustls::ClientSession;
+use rustls::Session;
+use rustls::StreamOwned;
 
 /// A HTTP(S) client.
 ///
@@ -34,7 +39,8 @@ pub struct Client {
 
 #[cfg(feature="rust_tls")]
 pub struct Client {
-    tcp_streams: HashMap<Origin, TcpStream>,
+    tls_streams: HashMap<Origin, StreamOwned<ClientSession, TcpStream>>,
+    tcp_streams: HashMap<Origin, TcpStream>
 }
 
 impl Client {
@@ -55,6 +61,7 @@ impl Client {
     pub fn new() -> Client {
         Client {
             tcp_streams: HashMap::new(),
+            tls_streams: HashMap::new()
         }
     }
 
@@ -210,39 +217,44 @@ impl Client {
 
     #[cfg(feature="rust_tls")]
     fn fetch_network_https<A: ToBody, B: FromBody>(
-    &mut self,
+        &mut self,
         request: &mut Request<A>,
     ) -> io::Result<Response<B>> {
         let origin = request.url().origin();
-                
-        let mut config = rustls::ClientConfig::new();
-        config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
 
-        let (mut sess, mut sock) = {
-           let domain = if let Some(domain) = request.url().domain() {
-               domain
-           } else {
-               return Err(io::Error::new(io::ErrorKind::InvalidInput, Error::NoDomain));
-           };
+        let mut tls_stream = if let Some(stream) = self.tls_streams.remove(&origin) {
+            debug!("Reusing connection to {:?}", origin);
+            stream
+        } else {
+            debug!("new connection for {:?}", origin);
+            let mut config = rustls::ClientConfig::new();
+            config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
 
-           let mut config = rustls::ClientConfig::new();
+            let (mut sess, mut sock) = {
+                let domain = if let Some(domain) = request.url().domain() {
+                    domain
+                } else {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, Error::NoDomain));
+                };
 
-           config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+                let mut config = rustls::ClientConfig::new();
 
-           let dns_name = webpki::DNSNameRef::try_from_ascii_str(domain).unwrap();
-           let mut sess = rustls::ClientSession::new(&Arc::new(config), dns_name);
-           let mut sock = TcpStream::connect(format!("{}:443", domain))?;
-           (sess, sock)
-       };
-       let mut tls_stream = rustls::Stream::new(&mut sess, &mut sock);
-        
+                config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+
+                let dns_name = webpki::DNSNameRef::try_from_ascii_str(domain).unwrap();
+                let mut sess = rustls::ClientSession::new(&Arc::new(config), dns_name);
+                let mut sock = TcpStream::connect(format!("{}:443", domain))?;
+                (sess, sock)
+            };
+            StreamOwned::new(sess, sock)
+        };
         let response = Client::fetch_data(request, &mut tls_stream)?;
         if is_persistent_connection(
             response.version(),
             response.headers().get_all(header::CONNECTION),
         ) {
             debug!("Keeping secure connection to {:?} for later use", origin);
-           // self.tls_streams.insert(origin, tls_stream);
+            self.tls_streams.insert(origin, tls_stream);
         } else {
             debug!("Closed secure connection to {:?}", origin);
         }
